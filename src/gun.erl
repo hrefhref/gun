@@ -127,9 +127,11 @@
 
 -type opts() :: #{
 	connect_timeout => timeout(),
+    connect_round_robin => boolean(),
 	cookie_ignore_informational => boolean(),
 	cookie_store => gun_cookies:store(),
 	domain_lookup_timeout => timeout(),
+    domain_lookup_dual_stack => boolean(),
 	event_handler => {module(), any()},
 	http_opts => http_opts(),
 	http2_opts => http2_opts(),
@@ -308,6 +310,8 @@ check_options([{connect_timeout, infinity}|Opts]) ->
 	check_options(Opts);
 check_options([{connect_timeout, T}|Opts]) when is_integer(T), T >= 0 ->
 	check_options(Opts);
+check_options([{connect_round_robin, B}|Opts]) when is_boolean(B) ->
+	check_options(Opts);
 check_options([{cookie_store, {Mod, _}}|Opts]) when is_atom(Mod) ->
 	check_options(Opts);
 check_options([{cookie_ignore_informational, B}|Opts]) when is_boolean(B) ->
@@ -315,6 +319,10 @@ check_options([{cookie_ignore_informational, B}|Opts]) when is_boolean(B) ->
 check_options([{domain_lookup_timeout, infinity}|Opts]) ->
 	check_options(Opts);
 check_options([{domain_lookup_timeout, T}|Opts]) when is_integer(T), T >= 0 ->
+	check_options(Opts);
+check_options([{domain_lookup_dual_stack, prefer_ipv4}|Opts]) ->
+	check_options(Opts);
+check_options([{domain_lookup_dual_stack, B}|Opts]) when is_boolean(B) ->
 	check_options(Opts);
 check_options([{event_handler, {Mod, _}}|Opts]) when is_atom(Mod) ->
 	check_options(Opts);
@@ -956,14 +964,16 @@ domain_lookup(_, {retries, Retries, _}, State=#state{host=Host, port=Port, opts=
 		event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
 	TransOpts = maps:get(tcp_opts, Opts, []),
 	DomainLookupTimeout = maps:get(domain_lookup_timeout, Opts, infinity),
+	DomainLookupDualStack = maps:get(domain_lookup_dual_stack, Opts, true),
 	DomainLookupEvent = #{
 		host => Host,
 		port => Port,
 		tcp_opts => TransOpts,
-		timeout => DomainLookupTimeout
+		timeout => DomainLookupTimeout,
+        dual_stack => DomainLookupDualStack
 	},
 	EvHandlerState1 = EvHandler:domain_lookup_start(DomainLookupEvent, EvHandlerState0),
-	case gun_tcp:domain_lookup(Host, Port, TransOpts, DomainLookupTimeout) of
+	case gun_tcp:domain_lookup(Host, Port, TransOpts, DomainLookupDualStack, DomainLookupTimeout) of
 		{ok, LookupInfo} ->
 			EvHandlerState = EvHandler:domain_lookup_end(DomainLookupEvent#{
 				lookup_info => LookupInfo
@@ -985,12 +995,14 @@ domain_lookup(Type, Event, State) ->
 connecting(_, {retries, Retries, LookupInfo}, State=#state{opts=Opts,
 		transport=Transport, event_handler=EvHandler, event_handler_state=EvHandlerState0}) ->
 	ConnectTimeout = maps:get(connect_timeout, Opts, infinity),
+    ConnectRR = maps:get(connect_round_robin, Opts, true),
 	ConnectEvent = #{
 		lookup_info => LookupInfo,
-		timeout => ConnectTimeout
+		timeout => ConnectTimeout,
+        round_robin => ConnectRR
 	},
 	EvHandlerState1 = EvHandler:connect_start(ConnectEvent, EvHandlerState0),
-	case gun_tcp:connect(LookupInfo, ConnectTimeout) of
+	case gun_tcp:connect(LookupInfo, ConnectRR, ConnectTimeout) of
 		{ok, Socket} when Transport =:= gun_tcp ->
 			[Protocol] = maps:get(protocols, Opts, [http]),
 			ProtocolName = case Protocol of

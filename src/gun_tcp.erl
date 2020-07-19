@@ -16,8 +16,8 @@
 
 -export([name/0]).
 -export([messages/0]).
--export([domain_lookup/4]).
--export([connect/2]).
+-export([domain_lookup/5]).
+-export([connect/3]).
 -export([send/2]).
 -export([setopts/2]).
 -export([sockname/1]).
@@ -41,19 +41,17 @@ messages() -> {tcp, tcp_closed, tcp_error}.
 %% and the actual connect step.
 
 -spec domain_lookup(inet:ip_address() | inet:hostname(),
-	inet:port_number(), [gen_tcp:connect_option()], timeout())
+	inet:port_number(), [gen_tcp:connect_option()], boolean() | prefer_ipv4, timeout())
 	-> {ok, lookup_info()} | {error, atom()}.
-domain_lookup(Address, Port0, Opts0, Timeout) ->
-	{Mod, Opts} = inet:tcp_module(Opts0, Address),
-	Timer = inet:start_timer(Timeout),
-	try Mod:getaddrs(Address, Timer) of
+domain_lookup(Address, Port0, Opts, DualStack, Timeout) ->
+    Families = families(Opts, DualStack),
+    case gun_inet:getaddrs(Address, Families, Timeout) of
 		{ok, IPs} ->
-			case Mod:getserv(Port0) of
+			case inet_tcp:getserv(Port0) of
 				{ok, Port} ->
 					{ok, #{
 						ip_addresses => IPs,
 						port => Port,
-						tcp_module => Mod,
 						tcp_opts => Opts ++ [binary, {active, false}, {packet, raw}]
 					}};
 				Error ->
@@ -61,33 +59,30 @@ domain_lookup(Address, Port0, Opts0, Timeout) ->
 			end;
 		Error ->
 			maybe_exit(Error)
-	after
-		_ = inet:stop_timer(Timer)
 	end.
 
--spec connect(lookup_info(), timeout())
+-spec connect(lookup_info(), boolean(), timeout())
 	-> {ok, inet:socket()} | {error, atom()}.
-connect(#{ip_addresses := IPs, port := Port, tcp_module := Mod, tcp_opts := Opts}, Timeout) ->
-	Timer = inet:start_timer(Timeout),
-	Res = try
-		try_connect(IPs, Port, Opts, Timer, Mod, {error, einval})
+connect(#{ip_addresses := IPs, port := Port, tcp_opts := Opts}, RR, Timeout) ->
+    RRTimeout = round_robin_timeout(RR, Timeout, IPs),
+	Timer = inet:start_timer(RRTimeout),
+	Res = try try_connect(IPs, Port, Opts, RR, Timer, Timeout, {error, einval}) of
+            {ok, S} -> {ok, S};
+            Error -> maybe_exit(Error)
 	after
 		_ = inet:stop_timer(Timer)
-	end,
-	case Res of
-		{ok, S} -> {ok, S};
-		Error -> maybe_exit(Error)
 	end.
 
-try_connect([IP|IPs], Port, Opts, Timer, Mod, _) ->
-	Timeout = inet:timeout(Timer),
-	case Mod:connect(IP, Port, Opts, Timeout) of
-		{ok, S} -> {ok, S};
-		{error, einval} -> {error, einval};
-		{error, timeout} -> {error, timeout};
-		Error -> try_connect(IPs, Port, Opts, Timer, Mod, Error)
+try_connect([{Family, IP}|IPs], Port, Opts0, RR, Timer, Timeout, _) ->
+    {Mod, Opts} = inet:tcp_module([Family | Opts0], IP),
+    ConnectTimeout = connect_timeout(RR, Timer, Timeout),
+	case {RR, Mod:connect(IP, Port, Opts, ConnectTimeout)} of
+        {_, {ok, S}} -> {ok, S};
+        {false, {error, einval}} -> {error, einval};
+        {false, {error, timeout}} -> {error, timeout};
+        {RR, Error} -> try_connect(IPs, Port, Opts, RR, Timer, Timeout, Error)
 	end;
-try_connect([], _, _, _, _, Error) ->
+try_connect([], _, _, _, _, _, Error) ->
 	Error.
 
 maybe_exit({error, einval}) -> exit(badarg);
@@ -109,3 +104,29 @@ sockname(Socket) ->
 -spec close(inet:socket()) -> ok.
 close(Socket) ->
 	gen_tcp:close(Socket).
+
+round_robin_timeout(false, Timeout, _) -> Timeout;
+round_robin_timeout(true, infinity, _) -> infinity;
+round_robin_timeout(true, Timeout, IPs) -> Timeout * length(IPs).
+
+connect_timeout(false, Timer, _) -> inet:timeout(Timer);
+connect_timeout(true, Timer, Timeout) ->
+  InetTimeout = inet:timeout(Timer),
+  if
+    InetTimeout < Timeout -> InetTimeout;
+    true -> Timeout
+  end.
+
+families(Opts, DualStack) ->
+  families(proplists:is_defined(inet, Opts),
+           proplists:is_defined(inet6, Opts),
+           proplists:is_defined(local, Opts),
+           DualStack).
+
+families(true, _, _, _) -> [inet];
+families(_, true, _, _) -> [inet6];
+families(_, _, true, _) -> [local];
+families(_, _, _, true) -> [inet6, inet];
+families(_, _, _, prefer_ipv4) -> [inet, inet6];
+families(_, _, _, false) -> [inet].
+
